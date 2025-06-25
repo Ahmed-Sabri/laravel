@@ -42,10 +42,52 @@ check_root() {
     fi
 }
 
+# Configure non-interactive mode
+configure_noninteractive() {
+    log "Configuring non-interactive mode"
+    export DEBIAN_FRONTEND=noninteractive
+    export NEEDRESTART_MODE=a
+    export NEEDRESTART_SUSPEND=1
+    success "Non-interactive mode configured"
+}
+
+# Pre-configure MySQL for headless installation
+preconfigure_mysql() {
+    log "Pre-configuring MySQL for headless installation"
+    
+    # Generate a random root password
+    local mysql_root_password=$(openssl rand -base64 32)
+    echo "mysql-server mysql-server/root_password password $mysql_root_password" | debconf-set-selections
+    echo "mysql-server mysql-server/root_password_again password $mysql_root_password" | debconf-set-selections
+    
+    # Save password to file for later use
+    echo "$mysql_root_password" > /root/.mysql_root_password
+    chmod 600 /root/.mysql_root_password
+    
+    success "MySQL pre-configured with root password saved to /root/.mysql_root_password"
+}
+
+# Pre-configure phpMyAdmin for headless installation
+preconfigure_phpmyadmin() {
+    log "Pre-configuring phpMyAdmin for headless installation"
+    
+    # Read MySQL root password
+    local mysql_root_password=$(cat /root/.mysql_root_password 2>/dev/null || echo "")
+    
+    # Configure phpMyAdmin selections
+    echo "phpmyadmin phpmyadmin/dbconfig-install boolean true" | debconf-set-selections
+    echo "phpmyadmin phpmyadmin/app-password-confirm password $mysql_root_password" | debconf-set-selections
+    echo "phpmyadmin phpmyadmin/mysql/admin-pass password $mysql_root_password" | debconf-set-selections
+    echo "phpmyadmin phpmyadmin/mysql/app-pass password $mysql_root_password" | debconf-set-selections
+    echo "phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2" | debconf-set-selections
+    
+    success "phpMyAdmin pre-configured for headless installation"
+}
+
 # Update system packages
 update_system() {
     log "Starting system update"
-    if apt update && apt upgrade -y; then
+    if apt update -qq && apt upgrade -y -qq; then
         success "System updated successfully"
     else
         handle_error "Failed to update system packages"
@@ -65,7 +107,7 @@ install_php_dependencies() {
         "php-zip"
     )
     
-    if apt install "${php_packages[@]}" -y; then
+    if apt install -y -qq "${php_packages[@]}"; then
         success "PHP packages installed successfully"
     else
         handle_error "Failed to install PHP packages"
@@ -83,9 +125,11 @@ install_system_utilities() {
         "unzip"
         "apache2"
         "glances"
+        "openssl"
+        "debconf-utils"
     )
     
-    if apt install "${utilities[@]}" -y; then
+    if apt install -y -qq "${utilities[@]}"; then
         success "System utilities installed successfully"
     else
         handle_error "Failed to install system utilities"
@@ -95,13 +139,23 @@ install_system_utilities() {
 # Install Composer
 install_composer() {
     log "Installing Composer"
-    if curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer; then
+    if curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer --quiet; then
         success "Composer installed successfully"
-        # Verify installation
-        if composer --version > /dev/null 2>&1; then
+        
+        # Make sure composer is executable
+        chmod +x /usr/local/bin/composer
+        
+        # Verify installation using full path instead of relying on PATH
+        if /usr/local/bin/composer --version --quiet > /dev/null 2>&1; then
             success "Composer is working correctly"
         else
-            warning "Composer installed but may not be in PATH"
+            # Try alternative verification method
+            if [[ -f "/usr/local/bin/composer" ]] && [[ -x "/usr/local/bin/composer" ]]; then
+                success "Composer binary installed and executable"
+                warning "Composer PATH will be available after shell configuration"
+            else
+                warning "Composer installed but verification failed"
+            fi
         fi
     else
         handle_error "Failed to install Composer"
@@ -132,7 +186,7 @@ configure_universal_shell_path() {
         "$user_home/.bashrc"
         "$user_home/.zshrc" 
         "$user_home/.profile"
-        "/etc/profile.d/laravel-setup.sh"  # System-wide configuration
+        "/etc/profile.d/laravel-setup.sh"
     )
     
     log "Configuring PATH for user: $actual_user (home: $user_home)"
@@ -219,11 +273,6 @@ configure_universal_shell_path() {
     echo -e "  ${YELLOW}source $primary_config${NC}"
     echo -e "  ${YELLOW}source /etc/profile.d/laravel-setup.sh${NC}"
     echo -e "  ${YELLOW}Or simply restart your terminal${NC}"
-    
-    # Try to source the configuration for the current session
-    if [[ -f "$primary_config" ]] && [[ $- == *i* ]]; then
-        source "$primary_config" 2>/dev/null && success "Configuration sourced for current session" || warning "Could not source configuration automatically"
-    fi
 }
 
 # Setup web directory permissions
@@ -251,7 +300,8 @@ create_laravel_project() {
     
     cd "$proj_dir" || handle_error "Cannot access project directory"
     
-    if composer create-project laravel/laravel "$APP_NAME"; then
+    # Use full path to composer since PATH might not be updated yet
+    if /usr/local/bin/composer create-project laravel/laravel "$APP_NAME" --quiet --no-interaction; then
         success "Laravel project '$APP_NAME' created successfully"
         
         # Set proper permissions for Laravel
@@ -275,8 +325,13 @@ create_laravel_project() {
 # Install and configure MySQL
 install_mysql() {
     log "Installing MySQL server"
-    if apt install mysql-server -y; then
+    if apt install -y -qq mysql-server; then
         success "MySQL server installed successfully"
+        
+        # Display root password location
+        if [[ -f "/root/.mysql_root_password" ]]; then
+            warning "MySQL root password saved in /root/.mysql_root_password"
+        fi
     else
         handle_error "Failed to install MySQL server"
     fi
@@ -285,9 +340,15 @@ install_mysql() {
 # Install phpMyAdmin
 install_phpmyadmin() {
     log "Installing phpMyAdmin"
-    if apt install phpmyadmin -y; then
+    if apt install -y -qq phpmyadmin; then
         success "phpMyAdmin installed successfully"
-        warning "Remember to configure phpMyAdmin with Apache manually if needed"
+        
+        # Enable phpMyAdmin configuration for Apache
+        if [[ -f "/etc/phpmyadmin/apache.conf" ]]; then
+            ln -sf /etc/phpmyadmin/apache.conf /etc/apache2/conf-available/phpmyadmin.conf
+            a2enconf phpmyadmin
+            success "phpMyAdmin Apache configuration enabled"
+        fi
     else
         handle_error "Failed to install phpMyAdmin"
     fi
@@ -310,7 +371,7 @@ restart_services() {
     fi
     
     # Enable services to start on boot
-    systemctl enable mysql apache2
+    systemctl enable mysql apache2 > /dev/null 2>&1
     success "Services enabled for startup"
 }
 
@@ -322,6 +383,11 @@ display_final_info() {
     echo -e "Web Server: ${YELLOW}Apache2${NC}"
     echo -e "Database: ${YELLOW}MySQL${NC}"
     echo -e "Log File: ${YELLOW}$LOG_FILE${NC}"
+    
+    if [[ -f "/root/.mysql_root_password" ]]; then
+        echo -e "MySQL Root Password: ${YELLOW}Saved in /root/.mysql_root_password${NC}"
+    fi
+    
     echo -e "\n${YELLOW}Shell Configuration:${NC}"
     echo "✓ Bash (.bashrc)"
     echo "✓ Zsh (.zshrc)" 
@@ -331,15 +397,18 @@ display_final_info() {
     echo "1. Restart your terminal or source your shell configuration"
     echo "2. Configure your Apache virtual host"
     echo "3. Set up your database connection in Laravel's .env file"
-    echo "4. Configure phpMyAdmin if needed"
+    echo "4. Access phpMyAdmin at http://your-server/phpmyadmin"
     echo "5. Test your Laravel application"
 }
 
 # Main execution function
 main() {
-    log "Starting Laravel setup script"
+    log "Starting Laravel setup script in headless mode"
     
     check_root
+    configure_noninteractive
+    preconfigure_mysql
+    preconfigure_phpmyadmin
     update_system
     install_php_dependencies
     install_system_utilities
